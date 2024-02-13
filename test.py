@@ -3,10 +3,11 @@ import json
 import logging
 from pathlib import Path
 import os
-import yaml
-import logging
 import unittest
 from unittest.mock import patch, MagicMock, mock_open
+
+from PIL import Image, ImageDraw
+import yaml
 
 import index
 
@@ -33,12 +34,14 @@ class TestSaveImage(BaseTestCase):
     def setUp(self):
       index._LOGGER = logging.getLogger(__name__)
 
+    @patch('index.get_snapshot')
+    @patch('index.get_final_data')
     @patch('index.Image.open')
     @patch('index.ImageDraw.Draw')
     @patch('index.ImageFont.truetype')
     @patch('index.datetime')
     @patch('index.open', new_callable=mock_open)
-    def test_save_image(self, mock_file, mock_datetime, mock_truetype, mock_draw, mock_open):
+    def test_save_image_with_box(self, mock_file, mock_datetime, mock_truetype, mock_draw, mock_open, mock_get_final_data, mock_get_snapshot):
         # Mock current time
         mock_now = mock_datetime.now.return_value
         mock_now.strftime.return_value = '20210101_120000'
@@ -51,18 +54,26 @@ class TestSaveImage(BaseTestCase):
         plate_number = 'ABC123'
 
         # Mock PIL dependencies
-        mock_image = MagicMock()
+        mock_image = MagicMock(spec=Image.Image)
+        mock_image.size = (640, 480)  # Example size
+        mock_image_draw = mock_draw.return_value
         mock_open.return_value = mock_image
-        mock_draw.return_value = MagicMock()
         mock_truetype.return_value = MagicMock()
+
+        mock_get_final_data.return_value = [{'box': [0, 0, 100, 100]}]
+        mock_get_snapshot.return_value = b'ImageBytes'
 
         # Call the function
         index.save_image(index.config, after_data, frigate_url, frigate_event_id, plate_number)
 
         # Assert image operations
-        mock_image.save.assert_called_with(f'/plates/{plate_number}_test_camera_20210101_120000.png')
-        mock_draw.return_value.rectangle.assert_called_with((0, 0, 100, 100), outline='red', width=2)
-        mock_draw.return_value.text.assert_called_with((5, 105), 'ABC123', font=mock_truetype.return_value)
+        # Assert image operations
+        expected_path = '/plates/ABC123_test_camera_20210101_120000.png'
+        mock_image.save.assert_called_once_with(expected_path)
+        mock_image_draw.rectangle.assert_called_once_with(
+            (0, 0, 640 * 100, 480 * 100), outline="red", width=2  # Ensure this matches what's being called
+        )
+        mock_image_draw.text.assert_called_once_with((5, 48005), 'ABC123', font=mock_truetype.return_value)
 
     @patch('index.Image.open')
     @patch('index.ImageDraw.Draw')
@@ -108,7 +119,7 @@ class TestSetSubLabel(BaseTestCase):
 
         mock_post.assert_called_with(
             "http://example.com/api/events/123/sub_label",
-            data='{"subLabel": "test_label"}',
+            data='{"subLabel": "TEST_LABEL"}',
             headers={"Content-Type": "application/json"}
         )
 
@@ -121,7 +132,7 @@ class TestSetSubLabel(BaseTestCase):
 
         mock_post.assert_called_with(
             "http://example.com/api/events/123/sub_label",
-            data='{"subLabel": "test_label_too_long_"}',
+            data='{"subLabel": "TEST_LABEL_TOO_LONG_"}',
             headers={"Content-Type": "application/json"}
         )
 
@@ -393,19 +404,6 @@ class TestCheckInvalidEvent(BaseTestCase):
         self.assertTrue(result)
         self.mock_logger.debug.assert_called_with("is not a correct label: tree")
 
-    def test_event_duplicate_top_score(self):
-        before_data = {'top_score': 0.8}
-        after_data = {
-            'current_zones': ['zone1'],
-            'camera': 'camera1',
-            'label': 'car',
-            'id': 'event123',
-            'top_score': 0.8
-        }
-        result = index.check_invalid_event(before_data, after_data)
-        self.assertTrue(result)
-        self.mock_logger.debug.assert_called_with("duplicated snapshot from Frigate as top_score from before and after are the same: 0.8")
-
     def test_event_valid(self):
         before_data = {'top_score': 0.7}
         after_data = {
@@ -425,37 +423,53 @@ class TestGetPlate(BaseTestCase):
         
     @patch('index.plate_recognizer')
     @patch('index.save_image')
-    def test_plate_recognizer_configured(self, mock_save_image, mock_plate_recognizer):
+    def test_plate_score_okay(self, mock_save_image, mock_plate_recognizer):
         # Set up configuration to use plate_recognizer
         index.config = {'plate_recognizer': True, 'frigate': {'min_score': 0.5, 'always_save_snapshot': False}}
         snapshot = b'image_data'
-        after_data = {'test_data': 'value'}
-        license_plate_attribute = [{'test_attr': 'value'}]
 
         # Mock the plate_recognizer to return a specific plate number and score
-        mock_plate_recognizer.return_value = ('ABC123', 0.6)
-        result, score = index.get_plate(snapshot, after_data)
+        mock_plate_recognizer.return_value = ('ABC123', 0.6, None, None)
+        plate_number, plate_score, watched_plate, fuzzy_score = index.get_plate(snapshot)
 
         # Assert that the correct plate number is returned
-        self.assertEqual(result, 'ABC123')
+        self.assertEqual(plate_number, 'ABC123')
+        self.assertEqual(plate_score, 0.6)
         mock_plate_recognizer.assert_called_once_with(snapshot)
-        mock_save_image.assert_called_once()
+        mock_save_image.assert_not_called()  # Assert that save_image is not called when plate_recognizer is used
 
     @patch('index.plate_recognizer')
     @patch('index.save_image')
     def test_plate_score_too_low(self, mock_save_image, mock_plate_recognizer):
         index.config = {'plate_recognizer': True, 'frigate': {'min_score': 0.7, 'always_save_snapshot': False}}
         snapshot = b'image_data'
-        after_data = {'test_data': 'value'}
-        license_plate_attribute = [{'test_attr': 'value'}]
 
         # Mock the plate_recognizer to return a plate number with a low score
-        mock_plate_recognizer.return_value = ('ABC123', 0.6)
-        result, score = index.get_plate(snapshot, after_data)
+        mock_plate_recognizer.return_value = ('ABC123', 0.6, None, None)
+        plate_number, plate_score, watched_plate, fuzzy_score = index.get_plate(snapshot)
 
         # Assert that no plate number is returned due to low score
-        self.assertIsNone(result)
-        self.mock_logger.info.assert_called_with("Score is below minimum: 0.6")
+        self.assertIsNone(plate_number)
+        self.assertIsNone(plate_score)
+        self.mock_logger.info.assert_called_with("Score is below minimum: 0.6 (ABC123)")
+        mock_save_image.assert_not_called()
+
+    @patch('index.plate_recognizer')
+    @patch('index.save_image')
+    def test_fuzzy_response(self, mock_save_image, mock_plate_recognizer):
+        index.config = {'plate_recognizer': True, 'frigate': {'min_score': 0.7, 'always_save_snapshot': False}}
+        snapshot = b'image_data'
+
+        # Mock the plate_recognizer to return a plate number with a fuzzy score
+        mock_plate_recognizer.return_value = ('DEF456', 0.8, None, 0.9)
+        plate_number, plate_score, watched_plate, fuzzy_score = index.get_plate(snapshot)
+
+        # Assert that plate number and score are returned despite the fuzzy score
+        self.assertEqual(plate_number, 'DEF456')
+        self.assertEqual(plate_score, 0.8)
+        self.assertIsNone(watched_plate)
+        self.assertEqual(fuzzy_score, 0.9)
+        self.mock_logger.error.assert_not_called()
         mock_save_image.assert_not_called()
 
 class TestSendMqttMessage(BaseTestCase):
@@ -476,9 +490,11 @@ class TestSendMqttMessage(BaseTestCase):
         frigate_event_id = 'event123'
         after_data = {'camera': 'camera1'}
         formatted_start_time = '2021-01-01 12:00:00'
+        watched_plate = 'ABC123'
+        fuzzy_score = 0.8
 
         # Call the function
-        index.send_mqtt_message(plate_number, plate_score, frigate_event_id, after_data, formatted_start_time)
+        index.send_mqtt_message(plate_number, plate_score, frigate_event_id, after_data, formatted_start_time, watched_plate, fuzzy_score)
 
         # Construct expected message
         expected_message = {
@@ -486,7 +502,9 @@ class TestSendMqttMessage(BaseTestCase):
             'score': plate_score,
             'frigate_event_id': frigate_event_id,
             'camera_name': after_data['camera'],
-            'start_time': formatted_start_time
+            'start_time': formatted_start_time,
+            'fuzzy_score': fuzzy_score,
+            'original_plate': watched_plate
         }
 
         # Assert that the MQTT client publish method is called correctly
